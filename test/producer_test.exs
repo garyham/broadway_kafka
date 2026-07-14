@@ -49,16 +49,24 @@ defmodule BroadwayKafka.ProducerTest do
     defrecordp :kafka_message, extract(:kafka_message, from_lib: "brod/include/brod.hrl")
 
     @impl true
-    def init(opts), do: {:ok, opts[:child_specs], Map.new(opts)}
+    def init(opts) do
+      shared_client_id =
+        if opts[:shared_client] do
+          Module.concat(opts[:broadway][:name], SharedClient)
+        end
+
+      config = opts |> Map.new() |> Map.put(:shared_client_id, shared_client_id)
+      {:ok, opts[:child_specs], config}
+    end
 
     @impl true
-    def setup(_stage_pid, client_id, _callback_module, config) do
+    def setup(stage_pid, client_id, _callback_module, config) do
       if !Process.whereis(client_id) do
         {:ok, _pid} = Agent.start(fn -> Map.put(config, :connected, true) end, name: client_id)
-        Process.monitor(client_id)
       end
 
-      send(config[:test_pid], {:setup, client_id})
+      Process.monitor(client_id)
+      send(config[:test_pid], {:setup, stage_pid, client_id})
       {pid, ref} = spawn_monitor(fn -> Process.sleep(:infinity) end)
 
       if config[:expose_group_coordinator] do
@@ -135,8 +143,10 @@ defmodule BroadwayKafka.ProducerTest do
 
     @impl true
     def disconnect(client_id) do
-      test_pid = Agent.get(client_id, fn config -> config.test_pid end)
-      send(test_pid, :disconnected)
+      if Process.whereis(client_id) do
+        test_pid = Agent.get(client_id, fn config -> config.test_pid end)
+        send(test_pid, :disconnected)
+      end
 
       :ok
     end
@@ -184,6 +194,10 @@ defmodule BroadwayKafka.ProducerTest do
       send(test_pid, {:batch_handled, content})
       messages
     end
+  end
+
+  def handle_client_down(event, measurements, metadata, test_pid) do
+    send(test_pid, {:client_down, event, measurements, metadata})
   end
 
   defmacro assert_receive_in_order({type, content} = pattern, opts) do
@@ -680,16 +694,101 @@ defmodule BroadwayKafka.ProducerTest do
     {:ok, message_server} = MessageServer.start_link()
     {:ok, pid} = start_broadway(message_server)
 
-    assert_receive {:setup, client_id}
+    assert_receive {:setup, _producer, client_id}
 
     Process.exit(Process.whereis(client_id), :kill)
-    refute_receive {:setup, _}
+    refute_receive {:setup, _, _}
 
     {:ok, _} = Agent.start_link(fn -> %{test_pid: self(), connected: false} end, name: client_id)
-    refute_receive {:setup, _}
+    refute_receive {:setup, _, _}
 
     Agent.update(client_id, fn state -> Map.put(state, :connected, true) end)
-    assert_receive {:setup, ^client_id}
+    assert_receive {:setup, _producer, ^client_id}
+
+    stop_broadway(pid)
+  end
+
+  test "emits telemetry with client failure details" do
+    attach_client_down_handler()
+    {:ok, message_server} = MessageServer.start_link()
+    broadway_name = new_unique_name()
+    {:ok, pid} = start_broadway(message_server, name: broadway_name)
+
+    assert_receive {:setup, producer_pid, client_id}
+    {_, producer_name} = Process.info(producer_pid, :registered_name)
+    reason = {:connection_lost, make_ref()}
+    Process.exit(Process.whereis(client_id), reason)
+
+    assert_receive {:client_down, [:broadway_kafka, :client, :down], measurements, metadata}
+    assert is_integer(measurements.system_time)
+
+    assert metadata == %{
+             name: broadway_name,
+             producer: producer_name,
+             client_id: client_id,
+             shared_client: false,
+             reason: reason
+           }
+
+    stop_broadway(pid)
+  end
+
+  test "normal Broadway shutdown does not emit client failure telemetry" do
+    attach_client_down_handler()
+    {:ok, message_server} = MessageServer.start_link()
+    {:ok, pid} = start_broadway(message_server)
+    assert_receive {:setup, _producer, _client_id}
+
+    stop_broadway(pid)
+
+    refute_receive {:client_down, _, _, _}
+  end
+
+  test "a private client failure identifies only its producer" do
+    attach_client_down_handler()
+    {:ok, message_server} = MessageServer.start_link()
+    {:ok, pid} = start_broadway(message_server, producers_concurrency: 2)
+
+    assert_receive {:setup, producer_1, client_1}
+    assert_receive {:setup, producer_2, client_2}
+    refute producer_1 == producer_2
+    refute client_1 == client_2
+    {_, producer_name} = Process.info(producer_1, :registered_name)
+
+    Process.exit(Process.whereis(client_1), :selected_client_failure)
+
+    assert_receive {:client_down, _, _, metadata}
+    assert metadata.producer == producer_name
+    assert metadata.client_id == client_1
+    assert metadata.reason == :selected_client_failure
+    refute_receive {:client_down, _, _, _}
+
+    stop_broadway(pid)
+  end
+
+  test "each producer reports a shared client failure" do
+    attach_client_down_handler()
+    {:ok, message_server} = MessageServer.start_link()
+
+    {:ok, pid} =
+      start_broadway(message_server, producers_concurrency: 2, shared_client: true)
+
+    assert_receive {:setup, producer_1, client_id}
+    assert_receive {:setup, producer_2, ^client_id}
+    producer_names = MapSet.new([registered_name(producer_1), registered_name(producer_2)])
+
+    Process.exit(Process.whereis(client_id), {:shared_failure, 42})
+
+    assert_receive {:client_down, _, _, metadata_1}
+    assert_receive {:client_down, _, _, metadata_2}
+
+    assert MapSet.new([metadata_1.producer, metadata_2.producer]) == producer_names
+
+    for metadata <- [metadata_1, metadata_2] do
+      assert metadata.client_id == client_id
+      assert metadata.shared_client
+      assert metadata.reason == {:shared_failure, 42}
+    end
 
     stop_broadway(pid)
   end
@@ -716,7 +815,7 @@ defmodule BroadwayKafka.ProducerTest do
         group_instance_id: "consumer-1"
       )
 
-    assert_receive {:setup, client_id}
+    assert_receive {:setup, _producer, client_id}
     assert_receive {:group_coordinator, group_coordinator}
 
     producer_name = get_producer(pid)
@@ -764,7 +863,7 @@ defmodule BroadwayKafka.ProducerTest do
 
     refute_receive {:messages_fetched, _}, 30
     refute_receive {:message_handled, _}
-    refute_receive {:setup, _}, 30
+    refute_receive {:setup, _, _}, 30
     refute_receive {:telemetry, [:broadway_kafka, :fenced_instance_id], _, _}
 
     assert Process.alive?(producer)
@@ -820,7 +919,7 @@ defmodule BroadwayKafka.ProducerTest do
         shared_client: true
       )
 
-    assert_receive {:setup, client_id}
+    assert_receive {:setup, _producer, client_id}
     assert_receive {:group_coordinator, group_coordinator}
 
     producer = pid |> get_producer() |> Process.whereis()
@@ -834,7 +933,7 @@ defmodule BroadwayKafka.ProducerTest do
     assert Process.alive?(Process.whereis(client_id))
 
     send(producer, :reconnect)
-    refute_receive {:setup, _}, 30
+    refute_receive {:setup, _, _}, 30
     assert Process.alive?(producer)
 
     stop_broadway(pid)
@@ -1037,7 +1136,7 @@ defmodule BroadwayKafka.ProducerTest do
 
     {:ok, pid} =
       Broadway.start_link(Forwarder,
-        name: new_unique_name(),
+        name: opts[:name] || new_unique_name(),
         context: %{test_pid: self()},
         producer: [
           module:
@@ -1100,6 +1199,25 @@ defmodule BroadwayKafka.ProducerTest do
 
   defp new_unique_name() do
     :"Broadway#{System.unique_integer([:positive, :monotonic])}"
+  end
+
+  defp attach_client_down_handler do
+    handler_id = {__MODULE__, self(), make_ref()}
+
+    :ok =
+      :telemetry.attach(
+        handler_id,
+        [:broadway_kafka, :client, :down],
+        &__MODULE__.handle_client_down/4,
+        self()
+      )
+
+    on_exit(fn -> :telemetry.detach(handler_id) end)
+  end
+
+  defp registered_name(pid) do
+    {_, name} = Process.info(pid, :registered_name)
+    name
   end
 
   defp get_producer(broadway, index \\ 0) do

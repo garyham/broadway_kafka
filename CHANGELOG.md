@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+  * Emit `[:broadway_kafka, :client, :down]` telemetry when a producer observes
+    its Kafka client terminate
+
 ## v0.6.1 (2026-08-31)
 
   * Require `:brod` 4.6.3.

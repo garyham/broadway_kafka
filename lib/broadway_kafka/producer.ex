@@ -91,6 +91,19 @@ defmodule BroadwayKafka.Producer do
       because Kafka fenced its static group member. The measurement is `:system_time`. The
       metadata includes `:producer`, `:client_id`, `:group_id`, and `:group_instance_id`.
 
+    * `[:broadway_kafka, :client, :down]` - emitted when a producer stage observes
+      its monitored Kafka client terminate. The measurements are
+      `%{system_time: System.system_time()}`. The metadata contains the Broadway
+      topology `:name`, registered producer-stage `:producer`, brod `:client_id`,
+      whether the client is shared as `:shared_client`, and the unmodified exit
+      `:reason`.
+
+      The event describes the producer which observed the failure. With a private
+      client, one event is emitted for the affected producer. With
+      `shared_client: true`, every producer monitoring the shared client may emit
+      an event with the same `:client_id` and a distinct `:producer`; event ordering
+      is not guaranteed.
+
   ## Shared Client Performance
 
   Enabling shared client may drastically decrease performance. Since connection is handled by a single process,
@@ -176,6 +189,8 @@ defmodule BroadwayKafka.Producer do
 
     state = %{
       client: opts[:client] || BroadwayKafka.BrodClient,
+      broadway_name: opts[:broadway][:name],
+      producer_name: producer_name,
       client_id: client_id,
       group_coordinator: nil,
       receive_timer: nil,
@@ -387,7 +402,9 @@ defmodule BroadwayKafka.Producer do
     {:noreply, [], %{state | client_connected?: false}}
   end
 
-  def handle_info({:DOWN, _ref, _, {client_id, _}, _reason}, %{client_id: client_id} = state) do
+  def handle_info({:DOWN, _ref, _, {client_id, _}, reason}, %{client_id: client_id} = state) do
+    emit_client_down(state, reason)
+
     if coord = state.group_coordinator do
       Process.exit(coord, :shutdown)
     end
@@ -692,6 +709,20 @@ defmodule BroadwayKafka.Producer do
       error ->
         raise "Cannot connect to Kafka. Reason #{inspect(error)}"
     end
+  end
+
+  defp emit_client_down(state, reason) do
+    :telemetry.execute(
+      [:broadway_kafka, :client, :down],
+      %{system_time: System.system_time()},
+      %{
+        name: state.broadway_name,
+        producer: state.producer_name,
+        client_id: state.client_id,
+        shared_client: state.shared_client,
+        reason: reason
+      }
+    )
   end
 
   defp build_allocator_spec_and_consumer_entry(
